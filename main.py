@@ -1,42 +1,22 @@
-from torch.nn.parallel import DataParallel, DistributedDataParallel
 import torch.distributed as dist
 from blip.blip import *
-from collections import OrderedDict
 import nibabel as nib
 from dataset import data_set
 import torch
-from torch.utils.data import DataLoader
 import argparse
+from torch.utils.data import DataLoader
 import logger
 import metrics
 
+from option import *
+
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
-
-
-
-global Narval, Mist, Sockeye, Colab, Local_Li, Local_Dong
-
-Narval = False
-Mist = True
-Sockeye = False
-Colab = False
-Local_Li = False
-Local_Dong = False
-
-
-torch.autograd.set_detect_anomaly(True)
-
-os.makedirs("images/training", exist_ok=True)
-os.makedirs("images/validation", exist_ok=True)
-os.makedirs("images/testing", exist_ok=True)
-os.makedirs("saved_models", exist_ok=True)
 
 parser = argparse.ArgumentParser()
 
 if Narval:
     from torch.nn.parallel import DataParallel, DistributedDataParallel
-
     parser.add_argument("--dist", type=bool, default=1, help="distribute or regular")
     parser.add_argument("--local_rank", default=-1, type=int)
     parser.add_argument("--dataset_path", type=str, default="/lustre07/scratch/uanazodo/dominic/ERG/data/high-field",
@@ -54,7 +34,7 @@ elif Mist:
     parser.add_argument("--report_path", type=str,
                         default="/gpfs/fs0/scratch/u/uanazodo/uanazodo/dominic/ERG/datasets/high-field/reports",
                         help="path of the report")
-    parser.add_argument("--batch_size", type=int, default=4, help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=3, help="size of the batches")
     parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
     torch.distributed.init_process_group(backend="nccl")
 elif Sockeye:
@@ -84,7 +64,7 @@ elif Local_Dong:
     parser.add_argument("--img_path", type=str,
                         default="E:/data/301", help="path of the dataset")
     parser.add_argument("--report_path", type=str, default="E:/reports", help="path of the diagnosis reports")
-    parser.add_argument("--batch_size", type=int, default=2, help="size of the batches")
+    parser.add_argument("--batch_size", type=int, default=3, help="size of the batches")
     parser.add_argument("--n_cpu", type=int, default=0, help="number of cpu threads to use during batch generation")
 else:
     raise ValueError("Invalid option")
@@ -101,7 +81,7 @@ parser.add_argument("--decay", type=float, default=0.05, help="adam: decay of fi
 # parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--decay_epoch", type=int, default=100, help="epoch from which to start lr decay")
 
-parser.add_argument("--channels", type=int, default=1, help="number of image channels")
+parser.add_argument("--channels", type=int, default=2, help="number of image channels")
 parser.add_argument("--width", type=int, default=192, help="image width")
 parser.add_argument("--height", type=int, default=192, help="image height")
 parser.add_argument("--depth", type=int, default=16, help="image depth / slice number")
@@ -109,6 +89,7 @@ parser.add_argument("--depth", type=int, default=16, help="image depth / slice n
 parser.add_argument("--patch_size", type=int, default=16, help="the side length of patch")
 parser.add_argument("--patch_depth", type=int, default=2, help="the depth of patch")
 parser.add_argument("--transformer_depth", type=int, default=12, help="number of transformer layers")
+parser.add_argument("--embed_dim", type=int, default=256, help="bert dim")
 
 parser.add_argument("--sample_interval", type=int, default=100, help="interval between saving image samples")
 parser.add_argument("--checkpoint_interval", type=int, default=1000, help="batch interval between model checkpoints")
@@ -119,6 +100,8 @@ parser.add_argument("--lambda_pixel", type=float, default=0.04, help="pixel-wise
 opt = parser.parse_args()
 print(opt)
 
+
+torch.autograd.set_detect_anomaly(True)
 world_size = torch.cuda.device_count()
 if world_size > 1:
     multi_gpu = True
@@ -135,7 +118,7 @@ else:
     device = torch.device("cuda")
 print("setting devices")
 
-model = blip_decoder(opt).to(device)
+model = blip_pretrain(opt).to(device)
 
 # if opt.epoch != 0:
 #     model.load_state_dict(torch.load("saved_models/model_%d.pth" % opt.epoch)['model'])
@@ -174,10 +157,22 @@ log_train = logger.Train_Logger(os.getcwd(), "train_log")
 log_val = logger.Train_Logger(os.getcwd(), "val_log")
 log_test = logger.Train_Logger(os.getcwd(), "test_log")
 print("Start training")
+
+os.makedirs("images/training", exist_ok=True)
+os.makedirs("images/validation", exist_ok=True)
+os.makedirs("images/testing", exist_ok=True)
+os.makedirs("saved_models", exist_ok=True)
+
+
+
 for epoch in range(0, 100):
 
     epoch_training_loss = metrics.LossAverage()
-    epoch_validating_loss = metrics.LossAverage()
+    epoch_mlm_loss = metrics.LossAverage()
+    epoch_ita_loss = metrics.LossAverage()
+    epoch_itm_loss = metrics.LossAverage()
+    epoch_lm_loss = metrics.LossAverage()
+
     for i, imgs in enumerate(dataloader):
         imgs_t1 = imgs["t1"]  # t1
         imgs_t2 = imgs["t2"]  # t2
@@ -187,30 +182,41 @@ for epoch in range(0, 100):
         # text_masks = imgs["report-mask"]
 
         imgs_t1, imgs_t2 = imgs_t1.float().to(device), imgs_t2.float().to(device)
-        # reports_tokens = reports_tokens.to(device)
-        # reports_tokens.input_ids = reports_tokens.input_ids[:,0,:]
-        # reports_tokens.attention_mask = reports_tokens.attention_mask[:, 0, :]
 
+        alpha = 0.4 * min(1, (epoch * len(dataloader) + i) / (2 * len(dataloader)))
         imgs = torch.cat((imgs_t1, imgs_t2), 1)
           # ------------------
           #  Train Generators
           # ------------------
+        # loss_mlm, loss_ita, loss_itm, loss_lm
+        loss_mlm, loss_ita, loss_itm, loss_lm = model(imgs, reports, alpha)
+        loss = loss_mlm + loss_ita + loss_itm + loss_lm
 
-        loss = model(imgs, reports)
+        loss_mlm_detached = loss_mlm.detach().clone()
+        loss_ita_detached = loss_ita.detach().clone()
+        loss_itm_detached = loss_itm.detach().clone()
+        loss_lm_detached = loss_lm.detach().clone()
+        loss_detached = loss.detach().clone()
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        # torch.cuda.empty_cache()
 
-        epoch_training_loss.update(loss.item(), imgs_t1.shape[0])
+        epoch_training_loss.update(loss_detached.item(), imgs_t1.shape[0])
+        epoch_mlm_loss.update(loss_mlm_detached.item(), imgs_t1.shape[0])
+        epoch_ita_loss.update(loss_ita_detached.item(), imgs_t1.shape[0])
+        epoch_itm_loss.update(loss_itm_detached.item(), imgs_t1.shape[0])
+        epoch_lm_loss.update(loss_lm_detached.item(), imgs_t1.shape[0])
 
         print(
-            "[Epoch %d/%d] [Batch %d/%d] [G loss: %f]"
+            "[Epoch %d/%d] [Batch %d/%d] [Total loss: %f, mlm loss: %f, ita loss: %f, itm loss: %f, lm loss: %f]"
             % (
                 epoch,
                 opt.n_epochs,
                 i,
                 len(dataloader),
-                loss.item()
+                loss_detached.item(), loss_mlm_detached.item(), loss_ita_detached.item(), loss_itm_detached.item(), loss_lm_detached.item()
             )
         )
 
@@ -221,7 +227,8 @@ for epoch in range(0, 100):
     torch.save(state_encoder, "saved_models/model_%d.pth" % epoch)
 
 
-    temp_log_train = OrderedDict({'Total loss': epoch_training_loss.avg,})
+    temp_log_train = OrderedDict({'Total loss': epoch_training_loss.avg, 'MLM loss': epoch_mlm_loss.avg, 'ITA loss': epoch_ita_loss.avg,
+                                  'ITM loss': epoch_itm_loss.avg, 'LM loss': epoch_lm_loss.avg,})
     log_train.update(epoch, temp_log_train)
 
     os.makedirs("images/validation/%d" % epoch, exist_ok=True)
@@ -236,7 +243,7 @@ for epoch in range(0, 100):
             train_dataset,
             batch_size=opt.batch_size,
             num_workers=opt.n_cpu, pin_memory=True)
-
+    print("Start validation")
     for i, imgs in enumerate(test_dataloader):
         imgs_t1 = imgs["t1"]  # t1
         imgs_t2 = imgs["t2"]  # t2
